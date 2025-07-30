@@ -8,9 +8,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mediapipe/camera_utils": "^0.3.1675466862",
+    "@mediapipe/holistic": "^0.5.1675471629",
     "framer-motion": "^12.23.9",
+    "konva": "^9.3.22",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-konva": "^19.0.7",
     "react-router-dom": "^6.30.1",
     "react-tsparticles": "^2.12.2",
     "tsparticles": "^3.8.1"
