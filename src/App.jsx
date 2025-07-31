@@ -1,14 +1,48 @@
-import React, { useRef, useEffect, useState } from "react";
-import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
+import React, { useRef, useEffect, useState, useCallback } from "react";
 import { motion, useMotionValue, useTransform, useSpring, AnimatePresence } from "framer-motion";
 import Particles from "react-tsparticles";
-import { loadFull } from "tsparticles";
+import { loadSlim } from "tsparticles-slim";
 
-const Home = () => {
+// Import TensorFlow.js (if used in App.jsx directly, otherwise can be removed)
+import * as tf from '@tensorflow/tfjs';
+
+// Import the GameAI component from the 'pages' folder
+import GameAI from './pages/GameAI.jsx'; // Corrected import path
+
+// Helper function for drawing landmarks (for MediaPipe visualization)
+// These helpers are only needed if MediaPipe is used in App.jsx directly.
+// Since it's moved to GameAI.jsx, these can be removed from App.jsx if not used elsewhere.
+const drawConnectors = (ctx, landmarks, connections, color) => {
+  if (!landmarks) return;
+  for (const connection of connections) {
+    const [startIdx, endIdx] = connection;
+    const start = landmarks[startIdx];
+    const end = landmarks[endIdx];
+    if (start && end) {
+      ctx.beginPath();
+      ctx.moveTo(start.x * ctx.canvas.width, start.y * ctx.canvas.height);
+      ctx.lineTo(end.x * ctx.canvas.width, end.y * ctx.canvas.height);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+};
+
+const drawLandmarks = (ctx, landmarks, color) => {
+  if (!landmarks) return;
+  for (const landmark of landmarks) {
+    ctx.beginPath();
+    ctx.arc(landmark.x * ctx.canvas.width, landmark.y * ctx.canvas.height, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+};
+
+const Home = ({ navigate }) => { // Pass navigate prop
   const x = useMotionValue(0);
   const y = useMotionValue(0);
-  const rotateX = useTransform(y, [0, window.innerHeight], [15, -15]);
-  const rotateY = useTransform(x, [0, window.innerWidth], [-15, 15]);
+  // Removed rotateX and rotateY as they are not used in the JSX
 
   return (
     <>
@@ -63,7 +97,7 @@ const Home = () => {
   );
 };
 
-const Navbar = () => {
+const Navbar = ({ navigate, currentPage }) => { // Pass navigate and currentPage
   const [cursorPos, setCursorPos] = useState({ x: 0, y: 0 });
   const [isInside, setIsInside] = useState(false);
 
@@ -97,12 +131,12 @@ const Navbar = () => {
           setY(0);
         }}
       >
-        <Link
-          to={to}
+        <button
+          onClick={() => navigate(to)} // Use navigate prop
           className="relative px-2 py-1 rounded transition duration-300 hover:bg-white/10 hover:shadow-glow nav-item"
         >
           {label}
-        </Link>
+        </button>
       </motion.div>
     );
   };
@@ -135,12 +169,12 @@ const Navbar = () => {
           damping: 24,
         }}
       />
-      <Link
-        to="/"
+      <button
+        onClick={() => navigate("/")} // Use navigate prop
         className="text-2xl font-bold transition duration-300 hover:text-blue-400 hover:drop-shadow-glow nav-item"
       >
         PAHAANA
-      </Link>
+      </button>
       <div className="space-x-6 flex items-center">
         {magneticMotionDiv("/", "Home")}
         {magneticMotionDiv("/pushup", "Push-Up AI")}
@@ -151,27 +185,201 @@ const Navbar = () => {
   );
 }
 
-
 const PushUpAI = () => {
-  const camera = useRef(null);
-  const [image, setImage] = useState(null);
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const modelRef = useRef(null); // For the loaded TensorFlow.js model
+  const poseRef = useRef(null); // For MediaPipe Pose
+  const cameraRef = useRef(null); // For MediaPipe Camera
 
-  // Helper to get current frame as canvas from video
-  const getVideoFrame = () => {
-    if (!camera.current) return null;
-    const video = camera.current;
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas;
-  };
+  const [loadingStatus, setLoadingStatus] = useState("Initializing...");
+  const [error, setError] = useState(null);
+  const [pushupCount, setPushupCount] = useState(0);
+  const [formFeedback, setFormFeedback] = useState("Ready");
+  const [isDetecting, setIsDetecting] = useState(false);
 
-  const capture = () => {
-    const photo = camera.current?.takePhoto();
-    setImage(photo);
-  };
+  // Load the TensorFlow.js model and MediaPipe Pose
+  useEffect(() => {
+    const loadAssets = async () => {
+      try {
+        setLoadingStatus("Loading TensorFlow.js model...");
+        // Changed tf.loadLayersModel to tf.loadGraphModel
+        const loadedModel = await tf.loadGraphModel('/model/model.json');
+        modelRef.current = loadedModel;
+        console.log('TensorFlow.js model loaded successfully!');
+        setLoadingStatus("TensorFlow.js model loaded.");
+
+        setLoadingStatus("Loading MediaPipe Pose...");
+        // Initialize MediaPipe Pose
+        // Access Pose from global window object after CDN script loads
+        if (!window.Pose || !window.Camera) {
+          throw new Error("MediaPipe Pose or Camera utilities not found. Ensure CDN scripts are loaded.");
+        }
+        const pose = new window.Pose({
+          locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+          }
+        });
+
+        pose.setOptions({
+          modelComplexity: 1, // 0, 1, or 2 (higher is more accurate but slower)
+          smoothLandmarks: true,
+          enableSegmentation: false,
+          smoothSegmentation: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+
+        pose.onResults(onResults); // Set up the callback for results
+        poseRef.current = pose;
+        console.log('MediaPipe Pose loaded successfully!');
+        setLoadingStatus("MediaPipe Pose loaded.");
+
+        setLoadingStatus("Accessing camera...");
+        // Access camera
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          // Access Camera from global window object after CDN script loads
+          const camera = new window.Camera(videoRef.current, {
+            onFrame: async () => {
+              if (poseRef.current && videoRef.current) {
+                await poseRef.current.send({ image: videoRef.current });
+              }
+            },
+            width: 640,
+            height: 480
+          });
+          camera.start();
+          cameraRef.current = camera;
+          console.log('Camera started.');
+          setLoadingStatus("Camera started. Ready for detection.");
+          setIsDetecting(true);
+        } else {
+          throw new Error("Camera not supported on this browser.");
+        }
+
+      } catch (err) {
+        console.error("Error loading assets:", err);
+        setError(`Failed to load: ${err.message}`);
+        setLoadingStatus("Error loading assets.");
+      }
+    };
+
+    loadAssets();
+
+    // Cleanup function
+    return () => {
+      if (modelRef.current) {
+        modelRef.current.dispose();
+        console.log('TensorFlow.js model disposed.');
+      }
+      if (poseRef.current) {
+        poseRef.current.close();
+        console.log('MediaPipe Pose closed.');
+      }
+      if (cameraRef.current) {
+        cameraRef.current.stop();
+        console.log('Camera stopped.');
+      }
+      if (videoRef.current && videoRef.current.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+
+  // MediaPipe results callback
+  const onResults = useCallback(async (results) => {
+    const canvasElement = canvasRef.current;
+    const canvasCtx = canvasElement.getContext('2d');
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    // Access POSE_CONNECTIONS from global window object
+    if (results.poseLandmarks && window.POSE_CONNECTIONS) {
+      drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, '#00FF00');
+      drawLandmarks(canvasCtx, results.poseLandmarks, '#FF0000');
+
+      // --- Inference with TensorFlow.js model ---
+      if (modelRef.current) {
+        // Preprocess landmarks for the model
+        // This is a placeholder. You need to adapt this based on your model's input
+        // Your model expects input_shape: [-1, 5, 66]
+        // This means a batch of sequences, where each sequence has 5 frames, and each frame has 66 features.
+        // 66 features likely come from 22 landmarks * 3 (x, y, z) or 33 landmarks * 2 (x, y)
+        // You'll need to collect a sequence of 5 frames of landmark data.
+        // For simplicity, let's just use the current frame's landmarks as a single input for now,
+        // but you'll need to implement a proper sequence buffer.
+
+        const landmarksArray = [];
+        if (results.poseLandmarks) {
+            // Assuming 33 landmarks from MediaPipe Pose, each with x, y, z, visibility
+            // We need to flatten this to 66 features (33 * 2 for x,y or 22*3 for x,y,z)
+            // The model input shape is [batch_size, sequence_length, features] = [-1, 5, 66]
+            // Let's assume your model expects 33 landmarks * 2 (x, y) = 66 features.
+            // You might need to filter out z and visibility if your model was trained only on x,y
+            results.poseLandmarks.forEach(landmark => {
+                landmarksArray.push(landmark.x);
+                landmarksArray.push(landmark.y);
+                // If your model uses z, add it: landmarksArray.push(landmark.z);
+            });
+        }
+
+        if (landmarksArray.length === 66) { // Ensure we have 66 features
+            // This is a single frame. Your model expects a sequence of 5 frames.
+            // You need to buffer frames and then pass a sequence of 5 frames to the model.
+            // For demonstration, let's just create a dummy sequence of 5 identical frames.
+            // In a real app, you'd collect 5 actual frames.
+            const sequenceLength = 5;
+            let inputTensorData = [];
+            for (let i = 0; i < sequenceLength; i++) {
+                inputTensorData = inputTensorData.concat(landmarksArray);
+            }
+
+            // Reshape to [1, 5, 66] (batch size 1, sequence length 5, 66 features)
+            const inputTensor = tf.tensor(inputTensorData, [1, sequenceLength, 66]);
+
+            try {
+                const prediction = modelRef.current.predict(inputTensor);
+                const outputData = await prediction.data();
+                // console.log("Model output:", outputData); // Log the raw output
+
+                // Process your model's output here
+                // Example: If your model outputs a class probability for "pushup_state"
+                // You'll need to map this to your specific push-up logic.
+                // For now, let's just show a dummy output based on some landmark positions.
+                const leftShoulder = results.poseLandmarks[11]; // Example landmark index
+                const leftElbow = results.poseLandmarks[13];
+                const leftWrist = results.poseLandmarks[15];
+
+                if (leftShoulder && leftElbow && leftWrist) {
+                    // Simple angle calculation for demonstration
+                    // This is NOT a robust push-up counter, just an example.
+                    const angle = Math.atan2(leftWrist.y - leftElbow.y, leftWrist.x - leftElbow.x) -
+                                  Math.atan2(leftShoulder.y - leftElbow.y, leftShoulder.x - leftElbow.x);
+                    const angleDeg = Math.abs(angle * 180 / Math.PI);
+
+                    if (angleDeg > 160) { // Arm relatively straight
+                        setFormFeedback("Up Position");
+                    } else if (angleDeg < 90) { // Arm bent
+                        setFormFeedback("Down Position");
+                    } else {
+                        setFormFeedback("Mid-way");
+                    }
+                }
+
+                prediction.dispose(); // Clean up tensor
+                inputTensor.dispose(); // Clean up input tensor
+
+            } catch (predError) {
+                console.error("Error during model prediction:", predError);
+                setFormFeedback("Prediction Error");
+            }
+        }
+      }
+    }
+    canvasCtx.restore();
+  }, []); // Dependencies for useCallback
 
   return (
     <>
@@ -185,75 +393,22 @@ const PushUpAI = () => {
         </motion.h2>
 
         <div className="backdrop-blur-xl bg-white/10 p-6 rounded-xl border border-white/10 w-full max-w-lg text-center">
-          <video ref={camera} autoPlay playsInline className="rounded w-full" />
+          {loadingStatus !== "Camera started. Ready for detection." && (
+            <div className="text-xl text-yellow-300 mb-4">{loadingStatus}</div>
+          )}
+          {error && (
+            <div className="text-xl text-red-500 mb-4">Error: {error}</div>
+          )}
+          <video ref={videoRef} autoPlay playsInline className="rounded w-full hidden" /> {/* Hidden video */}
+          <canvas ref={canvasRef} className="rounded w-full"></canvas> {/* Visible canvas */}
         </div>
 
-        <motion.button
-          onClick={capture}
-          whileHover={{ scale: 1.05 }}
-          className="px-6 py-2 rounded bg-blue-600 hover:bg-blue-500 transition-all"
-        >
-          Capture
-        </motion.button>
-
-        {image && (
-          <img
-            src={image}
-            alt="Captured"
-            className="rounded border-2 border-white mt-4 w-full max-w-sm"
-          />
-        )}
-      </div>
-    </>
-  );
-};
-
-const GameAI = () => {
-  const camera = useRef(null);
-  const [frame, setFrame] = useState(null);
-
-  // Helper to get current frame as canvas from video
-  const getVideoFrame = () => {
-    if (!camera.current) return null;
-    const video = camera.current;
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas;
-  };
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const photo = camera.current?.takePhoto();
-      setFrame(photo);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  return (
-    <>
-      <div className="p-6 min-h-screen text-white flex flex-col gap-6 items-center bg-pink-900/20 transition-colors duration-1000">
-        <motion.h2
-          className="text-4xl font-bold"
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-        >
-          Game Input AI
-        </motion.h2>
-
-        <div className="backdrop-blur-xl bg-white/10 p-6 rounded-xl border border-white/10 w-full max-w-lg text-center">
-          <video ref={camera} autoPlay playsInline className="rounded w-full" />
+        <div className="mt-4 text-xl">
+          <p>Push-ups: <span className="font-bold text-green-400">{pushupCount}</span></p>
+          <p>Form: <span className="font-bold text-blue-400">{formFeedback}</span></p>
         </div>
 
-        {frame && (
-          <img
-            src={frame}
-            alt="Game Input Frame"
-            className="rounded border-2 border-white mt-4 w-full max-w-sm"
-          />
-        )}
+        {/* Removed the capture button as we are streaming now */}
       </div>
     </>
   );
@@ -280,67 +435,85 @@ const About = () => (
 );
 
 export default function App() {
-  return (
-    <Router>
-      <AppContent />
-    </Router>
-  );
-}
-
-function AppContent() {
-  const location = useLocation();
-
-  const [transitionColor, setTransitionColor] = useState("#0f172a");
-  // Track if we're in a route transition and should show orbs
-  const [isTransitioning, setIsTransitioning] = useState(true);
-  const [prevPath, setPrevPath] = useState(location.pathname);
+  const [currentPage, setCurrentPage] = useState("/");
+  const [prevPath, setPrevPath] = useState("/");
   const [transitionDirection, setTransitionDirection] = useState(1);
+
+  const navigate = (path) => {
+    setPrevPath(currentPage);
+    setCurrentPage(path);
+  };
+
+  const [isTransitioning, setIsTransitioning] = useState(true);
 
   useEffect(() => {
     const isFromHome = prevPath === "/";
     setIsTransitioning(isFromHome);
     const timeout = setTimeout(() => setIsTransitioning(false), isFromHome ? 600 : 0);
     return () => clearTimeout(timeout);
-  }, [location, prevPath]);
-
-  useEffect(() => {
-    setPrevPath(location.pathname);
-  }, [location]);
-
-  useEffect(() => {
-    switch (location.pathname) {
-      case "/pushup":
-        setTransitionColor("#1e3a8a");
-        break;
-      case "/game":
-        setTransitionColor("#991b1b");
-        break;
-      case "/about":
-        setTransitionColor("#111827");
-        break;
-      default:
-        setTransitionColor("#0f172a");
-    }
-  }, [location]);
+  }, [currentPage, prevPath]);
 
   useEffect(() => {
     const modelOrder = ["/pushup", "/game"];
     const fromIndex = modelOrder.indexOf(prevPath);
-    const toIndex = modelOrder.indexOf(location.pathname);
+    const toIndex = modelOrder.indexOf(currentPage);
     if (fromIndex !== -1 && toIndex !== -1) {
       setTransitionDirection(toIndex > fromIndex ? 1 : -1);
+    } else {
+      setTransitionDirection(1); // Default direction for other transitions
     }
-  }, [location.pathname]);
+  }, [currentPage, prevPath]);
 
   const isBetweenModels =
-    ["/pushup", "/game"].includes(prevPath) && ["/pushup", "/game"].includes(location.pathname);
+    ["/pushup", "/game"].includes(prevPath) && ["/pushup", "/game"].includes(currentPage);
+
+  let transitionColor = "#0f172a";
+  switch (currentPage) {
+    case "/pushup":
+      transitionColor = "#1e3a8a";
+      break;
+    case "/game":
+      transitionColor = "#991b1b";
+      break;
+    case "/about":
+      transitionColor = "#111827";
+      break;
+    default:
+      transitionColor = "#0f172a";
+  }
 
   return (
     <>
+      <style>
+        {`
+          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+          body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #0f172a; /* Default background */
+            transition: background-color 0.5s ease-in-out;
+          }
+          .shadow-glow {
+            text-shadow: 0 0 8px rgba(96, 165, 250, 0.6), 0 0 12px rgba(96, 165, 250, 0.4);
+          }
+          .nav-item:hover {
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.3), 0 0 20px rgba(255, 255, 255, 0.1);
+          }
+        `}
+      </style>
+      {/* Include MediaPipe CDN scripts here.
+          These should be in your public/index.html or equivalent.
+          Example:
+          <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+          <script src="https://unpkg.com/react-konva/react-konva.min.js"></script>
+          <script src="https://unpkg.com/konva/konva.min.js"></script>
+      */}
       {/* Animated particles background */}
       <Particles
         id="tsparticles"
-        init={loadFull}
+        init={async (engine) => { await loadSlim(engine); }}
         className="fixed top-0 left-0 w-full h-full z-0"
         options={{
           fullScreen: false,
@@ -367,9 +540,9 @@ function AppContent() {
             className="fixed top-1/2 left-1/2 w-48 h-48 rounded-full z-50"
             style={{
               backgroundColor:
-                location.pathname === "/pushup"
+                currentPage === "/pushup"
                   ? "#3b82f6"
-                  : location.pathname === "/game"
+                  : currentPage === "/game"
                   ? "#ec4899"
                   : "#111827",
               filter: "blur(80px)",
@@ -383,51 +556,33 @@ function AppContent() {
           />
         )}
       </AnimatePresence>
-      <Navbar />
+      <Navbar navigate={navigate} currentPage={currentPage} />
       {/* Always mount content; orb overlays on top during transition */}
       <AnimatePresence mode="wait">
-        <Routes location={location} key={location.pathname}>
-          <Route path="/" element={<Home />} />
-          <Route
-            path="/pushup"
-            element={
-              <motion.div
-                initial={{ opacity: 0, x: 30 * transitionDirection }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -30 * transitionDirection }}
-                transition={{ duration: 0.5 }}
-              >
-                <PushUpAI />
-              </motion.div>
+        {/* Using key for AnimatePresence to detect route changes */}
+        <motion.div
+          key={currentPage} // Key ensures component remounts on route change for exit animations
+          initial={{ opacity: 0, x: isBetweenModels ? 30 * transitionDirection : 0 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: isBetweenModels ? -30 * transitionDirection : 0 }}
+          transition={{ duration: 0.5 }}
+          className="relative z-10" // Ensure content is above particles
+        >
+          {(() => {
+            switch (currentPage) {
+              case "/":
+                return <Home navigate={navigate} />;
+              case "/pushup":
+                return <PushUpAI />;
+              case "/game":
+                return <GameAI />;
+              case "/about":
+                return <About />;
+              default:
+                return <Home navigate={navigate} />;
             }
-          />
-          <Route
-            path="/game"
-            element={
-              <motion.div
-                initial={{ opacity: 0, x: 30 * transitionDirection }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -30 * transitionDirection }}
-                transition={{ duration: 0.5 }}
-              >
-                <GameAI />
-              </motion.div>
-            }
-          />
-          <Route
-            path="/about"
-            element={
-              <motion.div
-                initial={{ opacity: 0, x: 30 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -30 }}
-                transition={{ duration: 0.5 }}
-              >
-                <About />
-              </motion.div>
-            }
-          />
-        </Routes>
+          })()}
+        </motion.div>
       </AnimatePresence>
     </>
   );
