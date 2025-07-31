@@ -110,6 +110,9 @@ export default function GameAI() {
     const canvasElement = canvasRef.current;
     const canvasCtx = canvasElement.getContext('2d');
 
+    // Debug: Log model pipeline status
+    console.log("onResults called. Model loaded?", !!model, "Model object:", model);
+
     canvasCtx.save();
     canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
     canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
@@ -125,21 +128,46 @@ export default function GameAI() {
       }
 
       const keypoints = preprocessLandmarks(results.poseLandmarks);
+      // Debug: Log preprocessed landmarks
+      console.log("Preprocessed keypoints:", keypoints);
 
       setBuffer(prevBuffer => {
         const newBuffer = [...prevBuffer, keypoints];
         if (newBuffer.length > 5) newBuffer.shift(); // Keep only the last 5 frames
 
         if (newBuffer.length === 5 && newBuffer.every(frame => frame.length === 66)) {
+          console.log("Buffer length:", newBuffer.length);
+          console.log("Frame lengths:", newBuffer.map(f => f.length));
           (async () => {
+            // Wrap newBuffer in an extra array to add the batch dimension
             const input = tf.tensor([newBuffer], [1, 5, 66], "float32");
-            const pred = await model.executeAsync(input);
+            console.log("Model input shape:", input.shape);
+            input.data().then(data => {
+              console.log("Model input data:", Array.from(data));
+            });
+
+            let pred;
+            try {
+              console.log("Inputs for model execution:", input);
+              pred = await model.executeAsync(input);
+              if (Array.isArray(pred)) pred = pred[0];
+              console.log("Prediction tensor:", pred);
+            } catch (err) {
+              console.error("Prediction error:", err);
+              setPrediction("Prediction error: " + err.message);
+              tf.dispose([input]);
+              return;
+            }
 
             if (pred && pred instanceof tf.Tensor) {
               const predArray = await pred.array();
+              // Debug: Log prediction array
+              console.log("Prediction array:", predArray);
               if (Array.isArray(predArray) && predArray.length > 0) {
                 const topIndex = predArray[0].indexOf(Math.max(...predArray[0]));
                 const action = LABELS[topIndex];
+                // Debug: Log selected action and index
+                console.log("Selected action:", action, "at index", topIndex);
                 setPrediction(action);
                 updatePlayer(action);
               } else {
@@ -153,6 +181,11 @@ export default function GameAI() {
 
             tf.dispose([input, pred]);
           })();
+        } else {
+          console.warn("Skipping prediction. Buffer or frame lengths invalid:", {
+            bufferLength: newBuffer.length,
+            frameLengths: newBuffer.map(f => f.length)
+          });
         }
         return newBuffer;
       });
@@ -162,23 +195,33 @@ export default function GameAI() {
 
   // Load model on mount, with cleanup flag
   useEffect(() => {
-    let mounted = true;
-    setLoadingStatus("Loading TensorFlow.js model...");
-    tf.loadGraphModel("/model/model.json")
-      .then(m => {
-        if (mounted) {
-          console.log("GameAI Model loaded successfully!");
-          setModel(m);
-          setPrediction("idle");
-          setLoadingStatus("TensorFlow.js model loaded.");
-        }
-      })
-      .catch(err => {
-        console.error("GameAI Model load error:", err);
-        setError(`GameAI Model load error: ${err.message || err.toString()}. Ensure model.json and .bin files are in public/model/ and are valid graph models.`);
-        setLoadingStatus("Error loading GameAI model.");
-      });
-    return () => { mounted = false };
+
+    const loadModel = async () => {
+      await tf.setBackend("cpu");
+      await tf.ready();
+
+      let mounted = true;
+      setLoadingStatus("Loading TensorFlow.js model...");
+
+      tf.loadGraphModel("/model/model.json")
+        .then(m => {
+          if (mounted) {
+            console.log("GameAI Model loaded successfully!");
+            setModel(m);
+            setPrediction("idle");
+            setLoadingStatus("TensorFlow.js model loaded.");
+          }
+        })
+        .catch(err => {
+          console.error("GameAI Model load error:", err);
+          setError(`GameAI Model load error: ${err.message || err.toString()}. Ensure model.json and .bin files are in public/model/ and are valid graph models.`);
+          setLoadingStatus("Error loading GameAI model.");
+        });
+
+      return () => { mounted = false };
+    };
+
+    loadModel();
   }, []);
 
   // Check for MediaPipe readiness
