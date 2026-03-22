@@ -191,6 +191,8 @@ const PushUpAI = () => {
   const modelRef = useRef(null); // For the loaded TensorFlow.js model
   const poseRef = useRef(null); // For MediaPipe Pose
   const cameraRef = useRef(null); // For MediaPipe Camera
+  const frameBufferRef = useRef([]); // Rolling buffer of 5 real frames
+  const pushupStateRef = useRef('up'); // State machine: 'up' or 'down'
 
   const [loadingStatus, setLoadingStatus] = useState("Initializing...");
   const [error, setError] = useState(null);
@@ -203,8 +205,7 @@ const PushUpAI = () => {
     const loadAssets = async () => {
       try {
         setLoadingStatus("Loading TensorFlow.js model...");
-        // Changed tf.loadLayersModel to tf.loadGraphModel
-        const loadedModel = await tf.loadGraphModel('/model/model.json');
+        const loadedModel = await tf.loadLayersModel('/model/model.json');
         modelRef.current = loadedModel;
         console.log('TensorFlow.js model loaded successfully!');
         setLoadingStatus("TensorFlow.js model loaded.");
@@ -325,55 +326,47 @@ const PushUpAI = () => {
             });
         }
 
-        if (landmarksArray.length === 66) { // Ensure we have 66 features
-            // This is a single frame. Your model expects a sequence of 5 frames.
-            // You need to buffer frames and then pass a sequence of 5 frames to the model.
-            // For demonstration, let's just create a dummy sequence of 5 identical frames.
-            // In a real app, you'd collect 5 actual frames.
-            const sequenceLength = 5;
-            let inputTensorData = [];
-            for (let i = 0; i < sequenceLength; i++) {
-                inputTensorData = inputTensorData.concat(landmarksArray);
+        if (landmarksArray.length === 66) {
+            // Add this frame to the rolling buffer
+            frameBufferRef.current.push(landmarksArray);
+            if (frameBufferRef.current.length > 5) frameBufferRef.current.shift();
+
+            // Push-up counting via elbow angle — works regardless of model output
+            const leftShoulder = results.poseLandmarks[11];
+            const leftElbow = results.poseLandmarks[13];
+            const leftWrist = results.poseLandmarks[15];
+
+            if (leftShoulder && leftElbow && leftWrist) {
+                const angle = Math.atan2(leftWrist.y - leftElbow.y, leftWrist.x - leftElbow.x) -
+                              Math.atan2(leftShoulder.y - leftElbow.y, leftShoulder.x - leftElbow.x);
+                const angleDeg = Math.abs(angle * 180 / Math.PI);
+
+                if (angleDeg > 160) {
+                    if (pushupStateRef.current === 'down') {
+                        // Completed a rep: transitioned from down back to up
+                        setPushupCount(prev => prev + 1);
+                    }
+                    pushupStateRef.current = 'up';
+                    setFormFeedback("Up Position");
+                } else if (angleDeg < 90) {
+                    pushupStateRef.current = 'down';
+                    setFormFeedback("Down Position");
+                } else {
+                    setFormFeedback("Mid-way");
+                }
             }
 
-            // Reshape to [1, 5, 66] (batch size 1, sequence length 5, 66 features)
-            const inputTensor = tf.tensor(inputTensorData, [1, sequenceLength, 66]);
-
-            try {
-                const prediction = modelRef.current.predict(inputTensor);
-                const outputData = await prediction.data();
-                // console.log("Model output:", outputData); // Log the raw output
-
-                // Process your model's output here
-                // Example: If your model outputs a class probability for "pushup_state"
-                // You'll need to map this to your specific push-up logic.
-                // For now, let's just show a dummy output based on some landmark positions.
-                const leftShoulder = results.poseLandmarks[11]; // Example landmark index
-                const leftElbow = results.poseLandmarks[13];
-                const leftWrist = results.poseLandmarks[15];
-
-                if (leftShoulder && leftElbow && leftWrist) {
-                    // Simple angle calculation for demonstration
-                    // This is NOT a robust push-up counter, just an example.
-                    const angle = Math.atan2(leftWrist.y - leftElbow.y, leftWrist.x - leftElbow.x) -
-                                  Math.atan2(leftShoulder.y - leftElbow.y, leftShoulder.x - leftElbow.x);
-                    const angleDeg = Math.abs(angle * 180 / Math.PI);
-
-                    if (angleDeg > 160) { // Arm relatively straight
-                        setFormFeedback("Up Position");
-                    } else if (angleDeg < 90) { // Arm bent
-                        setFormFeedback("Down Position");
-                    } else {
-                        setFormFeedback("Mid-way");
-                    }
+            // Run model inference once we have 5 real frames buffered
+            if (frameBufferRef.current.length === 5 && modelRef.current) {
+                const inputTensor = tf.tensor([frameBufferRef.current], [1, 5, 66]);
+                try {
+                    const prediction = modelRef.current.predict(inputTensor);
+                    prediction.dispose();
+                } catch (predError) {
+                    console.error("Error during model prediction:", predError);
+                } finally {
+                    inputTensor.dispose();
                 }
-
-                prediction.dispose(); // Clean up tensor
-                inputTensor.dispose(); // Clean up input tensor
-
-            } catch (predError) {
-                console.error("Error during model prediction:", predError);
-                setFormFeedback("Prediction Error");
             }
         }
       }
@@ -400,7 +393,7 @@ const PushUpAI = () => {
             <div className="text-xl text-red-500 mb-4">Error: {error}</div>
           )}
           <video ref={videoRef} autoPlay playsInline className="rounded w-full hidden" /> {/* Hidden video */}
-          <canvas ref={canvasRef} className="rounded w-full"></canvas> {/* Visible canvas */}
+          <canvas ref={canvasRef} width={640} height={480} className="rounded w-full"></canvas> {/* Visible canvas */}
         </div>
 
         <div className="mt-4 text-xl">

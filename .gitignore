@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+.DS_Store
+*.local
+
+# AI/Claude files
+CLAUDE.md
+CLAUDE.local.md
+.claude/

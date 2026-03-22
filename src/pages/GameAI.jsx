@@ -1,8 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import * as tf from "@tensorflow/tfjs";
-import { Stage, Layer, Rect, Text } from "react-konva"; // Import directly from npm package
+import { Stage, Layer, Rect, Text } from "react-konva";
 
-// Helper function for drawing landmarks (for MediaPipe visualization)
 const drawConnectors = (ctx, landmarks, connections, color) => {
   if (!landmarks) return;
   for (const connection of connections) {
@@ -37,64 +36,44 @@ const LABELS = [
 
 export default function GameAI() {
   const videoRef = useRef(null);
-  const canvasRef = useRef(null); // Added canvas ref for drawing
-  const [model, setModel] = useState(null);
+  const canvasRef = useRef(null);
+  // Keep model and buffer in refs so onResults stays stable and never causes
+  // the camera effect to re-run. Stale-closure problems disappear.
+  const modelRef = useRef(null);
+  const bufferRef = useRef([]);
+
   const [prediction, setPrediction] = useState("Loading model...");
-  const [buffer, setBuffer] = useState([]);
   const [playerPos, setPlayerPos] = useState({ x: 150, y: 200, vy: 0, jumping: false });
   const [loadingStatus, setLoadingStatus] = useState("Initializing...");
+  const [modelLoaded, setModelLoaded] = useState(false); // triggers camera effect
   const [error, setError] = useState(null);
   const [isMediaPipeReady, setIsMediaPipeReady] = useState(false);
 
-
-  // Preprocess landmarks same as before
   const preprocessLandmarks = useCallback((landmarks) => {
-    // MediaPipe Pose provides 33 landmarks. Your model expects 66 features (33 * 2 for x,y).
-    // Normalize coordinates relative to the hip center (landmarks 23 and 24).
     const hipX = (landmarks[23].x + landmarks[24].x) / 2;
     const hipY = (landmarks[23].y + landmarks[24].y) / 2;
-
-    let keypoints = [];
+    const keypoints = [];
     for (const lm of landmarks) {
       keypoints.push(lm.x - hipX, lm.y - hipY);
     }
     return keypoints;
   }, []);
 
-  // updatePlayer separated for clarity
   const updatePlayer = useCallback((action) => {
     setPlayerPos((pos) => {
       let { x, y, vy, jumping } = pos;
-      const groundY = 200; // Define ground level for the player
+      const groundY = 200;
 
-      // Horizontal movement
-      if (action === "left" || action === "jump_left") {
-        x = Math.max(0, x - 5); // Prevent going off left edge
-      }
-      if (action === "right" || action === "jump_right") {
-        x = Math.min(640 - 50, x + 5); // Prevent going off right edge (Stage width - player width)
-      }
-
-      // Jump logic
+      if (action === "left" || action === "jump_left") x = Math.max(0, x - 5);
+      if (action === "right" || action === "jump_right") x = Math.min(640 - 50, x + 5);
       if ((action === "jump" || action === "jump_left" || action === "jump_right") && !jumping) {
-        vy = -15; // Initial jump velocity
+        vy = -15;
         jumping = true;
       }
 
-      // Crouch logic
-      if (action === "crouch") {
-        // Simple crouch: just lower the player's y position
-        // This might conflict with gravity if not handled carefully.
-        // For a simple demo, let's just make the player appear shorter.
-        // The Rect height in JSX handles the visual aspect.
-        // No change to y here, as gravity will pull it down.
-      }
-
-      // Apply gravity
       vy += 1;
       y += vy;
 
-      // Ground collision
       if (y >= groundY) {
         y = groundY;
         vy = 0;
@@ -103,15 +82,14 @@ export default function GameAI() {
 
       return { x, y, vy, jumping };
     });
-  }, []); // No dependencies needed if playerPos is accessed via callback argument
+  }, []);
 
-  // onResults now handles buffer safely and prediction outside tidy
+  // onResults reads model and buffer from refs — no reactive dependencies,
+  // so this callback never changes and never triggers a camera re-init.
   const onResults = useCallback((results) => {
     const canvasElement = canvasRef.current;
+    if (!canvasElement) return;
     const canvasCtx = canvasElement.getContext('2d');
-
-    // Debug: Log model pipeline status
-    console.log("onResults called. Model loaded?", !!model, "Model object:", model);
 
     canvasCtx.save();
     canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
@@ -121,132 +99,92 @@ export default function GameAI() {
       drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, '#00FF00');
       drawLandmarks(canvasCtx, results.poseLandmarks, '#FF0000');
 
-      if (!model) {
+      if (!modelRef.current) {
         setPrediction("Model not loaded yet...");
         canvasCtx.restore();
         return;
       }
 
       const keypoints = preprocessLandmarks(results.poseLandmarks);
-      // Debug: Log preprocessed landmarks
-      console.log("Preprocessed keypoints:", keypoints);
+      bufferRef.current.push(keypoints);
+      if (bufferRef.current.length > 5) bufferRef.current.shift();
 
-      setBuffer(prevBuffer => {
-        const newBuffer = [...prevBuffer, keypoints];
-        if (newBuffer.length > 5) newBuffer.shift(); // Keep only the last 5 frames
-
-        if (newBuffer.length === 5 && newBuffer.every(frame => frame.length === 66)) {
-          console.log("Buffer length:", newBuffer.length);
-          console.log("Frame lengths:", newBuffer.map(f => f.length));
-          (async () => {
-            // Wrap newBuffer in an extra array to add the batch dimension
-            const input = tf.tensor([newBuffer], [1, 5, 66], "float32");
-            console.log("Model input shape:", input.shape);
-            input.data().then(data => {
-              console.log("Model input data:", Array.from(data));
-            });
-
-            let pred;
-            try {
-              console.log("Inputs for model execution:", input);
-              pred = await model.executeAsync(input);
-              if (Array.isArray(pred)) pred = pred[0];
-              console.log("Prediction tensor:", pred);
-            } catch (err) {
-              console.error("Prediction error:", err);
-              setPrediction("Prediction error: " + err.message);
-              tf.dispose([input]);
-              return;
+      if (bufferRef.current.length === 5 && bufferRef.current.every(f => f.length === 66)) {
+        (async () => {
+          // Pass input as named dict matching the model signature key "inputs"
+          const input = tf.tensor([bufferRef.current], [1, 5, 66], "float32");
+          let pred;
+          try {
+            // Layers model: predict() handles LSTM natively (no graph while-loop issues)
+            pred = modelRef.current.predict(input);
+            const predArray = await pred.array();
+            if (Array.isArray(predArray) && predArray.length > 0) {
+              const topIndex = predArray[0].indexOf(Math.max(...predArray[0]));
+              const action = LABELS[topIndex];
+              setPrediction(action);
+              updatePlayer(action);
             }
-
-            if (pred && pred instanceof tf.Tensor) {
-              const predArray = await pred.array();
-              // Debug: Log prediction array
-              console.log("Prediction array:", predArray);
-              if (Array.isArray(predArray) && predArray.length > 0) {
-                const topIndex = predArray[0].indexOf(Math.max(...predArray[0]));
-                const action = LABELS[topIndex];
-                // Debug: Log selected action and index
-                console.log("Selected action:", action, "at index", topIndex);
-                setPrediction(action);
-                updatePlayer(action);
-              } else {
-                console.warn("Model prediction returned an empty or invalid array:", predArray);
-                setPrediction("Prediction error: Invalid output array");
-              }
-            } else {
-              console.warn("Model prediction returned an invalid tensor:", pred);
-              setPrediction("Prediction error: Invalid output tensor");
-            }
-
+          } catch (err) {
+            console.error("Prediction error:", err);
+            setPrediction("Prediction error: " + err.message);
+          } finally {
             tf.dispose([input, pred]);
-          })();
-        } else {
-          console.warn("Skipping prediction. Buffer or frame lengths invalid:", {
-            bufferLength: newBuffer.length,
-            frameLengths: newBuffer.map(f => f.length)
-          });
-        }
-        return newBuffer;
-      });
+          }
+        })();
+      }
     }
     canvasCtx.restore();
-  }, [model, preprocessLandmarks, updatePlayer]); // Depend on model, preprocessLandmarks, and updatePlayer
+  }, [preprocessLandmarks, updatePlayer]); // model and buffer read from refs — no dependency needed
 
-  // Load model on mount, with cleanup flag
+  // Load model once on mount
   useEffect(() => {
+    let mounted = true;
 
     const loadModel = async () => {
-      await tf.setBackend("cpu");
       await tf.ready();
-
-      let mounted = true;
       setLoadingStatus("Loading TensorFlow.js model...");
 
-      tf.loadGraphModel("/model/model.json")
-        .then(m => {
-          if (mounted) {
-            console.log("GameAI Model loaded successfully!");
-            setModel(m);
-            setPrediction("idle");
-            setLoadingStatus("TensorFlow.js model loaded.");
-          }
-        })
-        .catch(err => {
-          console.error("GameAI Model load error:", err);
-          setError(`GameAI Model load error: ${err.message || err.toString()}. Ensure model.json and .bin files are in public/model/ and are valid graph models.`);
-          setLoadingStatus("Error loading GameAI model.");
-        });
-
-      return () => { mounted = false };
+      try {
+        const m = await tf.loadLayersModel("/model/model.json");
+        if (mounted) {
+          modelRef.current = m;
+          setModelLoaded(true);
+          setPrediction("idle");
+          setLoadingStatus("TensorFlow.js model loaded.");
+          console.log("GameAI model loaded.");
+        }
+      } catch (err) {
+        console.error("Model load error:", err);
+        if (mounted) {
+          setError(`Model load error: ${err.message}. Ensure /public/model/model.json and .bin exist.`);
+          setLoadingStatus("Error loading model.");
+        }
+      }
     };
 
     loadModel();
+    return () => { mounted = false; };
   }, []);
 
-  // Check for MediaPipe readiness
+  // Check for MediaPipe CDN scripts
   useEffect(() => {
-    const checkMediaPipe = () => {
+    const check = () => {
       if (window.Pose && window.Camera && window.POSE_CONNECTIONS) {
         setIsMediaPipeReady(true);
-        setLoadingStatus("MediaPipe libraries loaded.");
       } else {
-        // Retry checking after a short delay if not ready
-        setTimeout(checkMediaPipe, 100);
+        setTimeout(check, 100);
       }
     };
-    checkMediaPipe();
-  }, []); // Run once on mount
+    check();
+  }, []);
 
-  // Setup MediaPipe pose + camera with cleanup
+  // Setup camera/pose only once both model and MediaPipe are ready
   useEffect(() => {
-    if (!videoRef.current || !model || !isMediaPipeReady) {
-      if (!model) console.log("Waiting for model to load before initializing camera/MediaPipe.");
-      if (!isMediaPipeReady) console.log("Waiting for MediaPipe libraries to load.");
-      return;
-    }
+    if (!videoRef.current || !modelLoaded || !isMediaPipeReady) return;
 
-    const initializeMediaPipe = async () => {
+    let cleanupFn;
+
+    const init = async () => {
       try {
         setLoadingStatus("Loading MediaPipe Pose...");
         const pose = new window.Pose({
@@ -256,19 +194,16 @@ export default function GameAI() {
         pose.setOptions({
           modelComplexity: 1,
           smoothLandmarks: true,
-          minDetectionConfidence: 0.9,
+          minDetectionConfidence: 0.5, // was 0.9 — too high, poses rarely triggered
           minTrackingConfidence: 0.5,
         });
 
         pose.onResults(onResults);
 
         setLoadingStatus("Accessing camera...");
-        console.log("Attempting to access camera...");
-
-        // Request camera access explicitly
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
         videoRef.current.srcObject = stream;
-        await videoRef.current.play(); // Ensure video is playing before sending frames
+        await videoRef.current.play();
 
         const camera = new window.Camera(videoRef.current, {
           onFrame: async () => {
@@ -284,20 +219,19 @@ export default function GameAI() {
         return () => {
           camera.stop();
           if (pose.close) pose.close();
-          if (stream) {
-            stream.getTracks().forEach(track => track.stop()); // Stop all tracks
-          }
+          stream.getTracks().forEach(t => t.stop());
         };
       } catch (err) {
-        console.error("MediaPipe/Camera initialization error:", err);
-        setError(`MediaPipe/Camera error: ${err.message || err.toString()}. Please ensure camera access is granted and CDN scripts are loaded.`);
-        setLoadingStatus("Error initializing camera/MediaPipe.");
+        console.error("Camera/MediaPipe init error:", err);
+        setError(`Camera error: ${err.message}`);
+        setLoadingStatus("Error initializing camera.");
       }
     };
 
-    initializeMediaPipe(); // Call directly now that isMediaPipeReady is a dependency
+    init().then(fn => { cleanupFn = fn; });
+    return () => { if (cleanupFn) cleanupFn(); };
 
-  }, [videoRef, model, isMediaPipeReady, onResults]); // Depend on model, isMediaPipeReady, and onResults
+  }, [modelLoaded, isMediaPipeReady, onResults]); // onResults is now stable — won't re-trigger
 
   return (
     <div style={{
@@ -305,7 +239,6 @@ export default function GameAI() {
       background: "linear-gradient(135deg, #1e293b, #0f172a)",
       color: "white"
     }}>
-      {/* Left: Webcam and Prediction Display */}
       <div style={{ flex: 1, position: "relative", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center" }}>
         {loadingStatus !== "Camera started. Ready for detection." && (
           <div className="text-xl text-yellow-300 mb-4">{loadingStatus}</div>
@@ -313,8 +246,8 @@ export default function GameAI() {
         {error && (
           <div className="text-xl text-red-500 mb-4">Error: {error}</div>
         )}
-        <video ref={videoRef} style={{ width: "100%", height: "auto", objectFit: "cover", display: "none" }} autoPlay muted playsInline />
-        <canvas ref={canvasRef} width="640" height="480" style={{ width: "100%", maxWidth: "640px", height: "auto", border: "1px solid white", borderRadius: "8px" }}></canvas>
+        <video ref={videoRef} style={{ display: "none" }} autoPlay muted playsInline />
+        <canvas ref={canvasRef} width="640" height="480" style={{ width: "100%", maxWidth: "640px", height: "auto", border: "1px solid white", borderRadius: "8px" }} />
         <div style={{
           position: "absolute", top: 10, left: 10,
           backgroundColor: "rgba(0,0,0,0.5)", padding: 10,
@@ -324,11 +257,10 @@ export default function GameAI() {
         </div>
       </div>
 
-      {/* Right: Simple Game */}
       <div style={{
-        flex: 1, backgroundColor: "rgba(255 255 255 / 0.1)",
+        flex: 1, backgroundColor: "rgba(255,255,255,0.1)",
         display: "flex", justifyContent: "center", alignItems: "flex-end",
-        overflow: "hidden" // Hide overflow for player movement
+        overflow: "hidden"
       }}>
         <Stage width={640} height={480} style={{ border: "1px solid white", borderRadius: "8px", marginBottom: "20px" }}>
           <Layer>
@@ -336,12 +268,12 @@ export default function GameAI() {
               x={playerPos.x}
               y={playerPos.y}
               width={50}
-              height={prediction === "crouch" ? 30 : 50} // Dynamic height for crouch
+              height={prediction === "crouch" ? 30 : 50}
               fill={
-                prediction === "punch" ? "#ef4444" : // Red for punch
-                prediction === "kick" ? "#f59e0b" :   // Orange for kick
-                prediction === "block" ? "#10b981" : // Green for block
-                "#3b82f6"                             // Blue for others (idle, jump, move)
+                prediction === "punch" ? "#ef4444" :
+                prediction === "kick" ? "#f59e0b" :
+                prediction === "block" ? "#10b981" :
+                "#3b82f6"
               }
               cornerRadius={8}
               shadowBlur={10}
