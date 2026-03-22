@@ -4,8 +4,3 @@ dist/
 .env.*
 .DS_Store
 *.local
-
-# AI/Claude files
-CLAUDE.md
-CLAUDE.local.md
-.claude/
